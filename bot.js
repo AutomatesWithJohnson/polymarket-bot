@@ -5,22 +5,34 @@ const CONFIG = {
   graphqlEndpoint: 'https://clob.polymarket.com/graphql',
   
   // Strategy 1: NO positions (probability harvesting)
-  // Target: 1-10% probability = 90-99% chance of winning
   minProbabilityNO: 1,
   maxProbabilityNO: 10,
   
-  // Strategy 2: YES positions (value bets) - UPDATED to 85-98%
+  // Strategy 2: YES positions (high confidence)
   minProbabilityYES: 85,
   maxProbabilityYES: 98,
   
   // Bet settings
   betSize: 1,
   maxBetsPerDay: 20,
+  
+  // NEW: Safety filters
+  minVolume: 100,           // Minimum $100 volume to trust the probability
+  minLiquidity: 50,         // Minimum $50 liquidity to actually place bet
+  maxDaysToSettle: 30,      // Skip markets settling > 30 days away (want fast turnover)
+  
+  // NEW: Niche filters (enable what you want)
+  niches: {
+    sports: false,   // Set true to focus on sports
+    politics: false, // Set true to focus on politics  
+    crypto: false,   // Set true to focus on crypto
+  }
 };
 
 // ============== STATE ==============
 let bets = [];
 let dailyBetCount = 0;
+let previousPrices = {}; // Track price history for confidence
 
 // ============== POLYMARKET API ==============
 async function getMarkets() {
@@ -56,31 +68,99 @@ async function getMarkets() {
   }
 }
 
-// ============== STRATEGY 1: NO POSITIONS (Probability Harvesting) ==============
-// Target outcomes with 1-10% probability = 90-99% chance of winning
+// ============== SAFETY CHECKS ==============
+function passesSafetyChecks(market, outcome) {
+  const volume = parseFloat(market.volume || 0);
+  const liquidity = parseFloat(market.liquidity || 0);
+  
+  // Check volume
+  if (volume < CONFIG.minVolume) {
+    return { pass: false, reason: `Low volume: $${volume} (need $${CONFIG.minVolume}+)` };
+  }
+  
+  // Check liquidity
+  if (liquidity < CONFIG.minLiquidity) {
+    return { pass: false, reason: `Low liquidity: $${liquidity} (need $${CONFIG.minLiquidity}+)` };
+  }
+  
+  // Check settlement date
+  const daysUntilSettle = (new Date(market.endDate) - new Date()) / (1000 * 60 * 60 * 24);
+  if (daysUntilSettle > CONFIG.maxDaysToSettle) {
+    return { pass: false, reason: `Settles in ${daysUntilSettle.toFixed(0)} days (too long)` };
+  }
+  
+  // Check niche filters
+  const categories = (market.categories || []).map(c => c.toLowerCase());
+  
+  if (CONFIG.niches.sports && !categories.some(c => c.includes('sport'))) {
+    return { pass: false, reason: 'Not a sports market' };
+  }
+  if (CONFIG.niches.politics && !categories.some(c => c.includes('polit'))) {
+    return { pass: false, reason: 'Not a politics market' };
+  }
+  if (CONFIG.niches.crypto && !categories.some(c => c.includes('crypto') || c.includes('bitcoin'))) {
+    return { pass: false, reason: 'Not a crypto market' };
+  }
+  
+  return { pass: true };
+}
+
+// ============== CONFIDENCE CHECK ==============
+function getConfidenceScore(marketId, currentPrice) {
+  // Check if we've seen this market before
+  if (!previousPrices[marketId]) {
+    previousPrices[marketId] = [];
+  }
+  
+  const history = previousPrices[marketId];
+  history.push({ price: currentPrice, time: Date.now() });
+  
+  // Keep last 6 readings (30 minutes at 5-min intervals)
+  if (history.length > 6) history.shift();
+  
+  if (history.length < 3) return 100; // Can't calculate, assume confident
+  
+  // Check price stability
+  const prices = history.map(h => h.price);
+  const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+  const variance = prices.reduce((sum, p) => sum + Math.pow(p - avg, 2), 0) / prices.length;
+  const stdDev = Math.sqrt(variance);
+  
+  // Lower stdDev = more stable = higher confidence
+  // If stdDev > 10%, it's volatile
+  const confidence = Math.max(0, 100 - (stdDev * 5));
+  
+  return confidence;
+}
+
+// ============== STRATEGY 1: NO POSITIONS ==============
 function findNoValueBets(markets) {
   const opportunities = [];
   
   for (const market of markets) {
     if (!market.outcomePrices || !market.outcomeNames) continue;
-    if (new Date(market.endDate) < new Date()) continue;
     
     const outcomes = market.outcomeNames.map((name, i) => ({
       name,
       price: parseFloat(market.outcomePrices[i]) * 100
     }));
     
-    // Find NO outcome
     const noOutcome = outcomes.find(o => 
-      o.name.toLowerCase() === 'no' || 
-      o.name.toLowerCase() === 'negative'
+      o.name.toLowerCase() === 'no' || o.name.toLowerCase() === 'negative'
     );
     
     if (!noOutcome) continue;
     
-    // NO position with 1-10% price = 90-99% chance of winning
     if (noOutcome.price >= CONFIG.minProbabilityNO && 
         noOutcome.price <= CONFIG.maxProbabilityNO) {
+      
+      // Run safety checks
+      const safety = passesSafetyChecks(market, noOutcome);
+      if (!safety.pass) continue;
+      
+      // Check confidence
+      const confidence = getConfidenceScore(market.id, noOutcome.price);
+      if (confidence < 50) continue; // Skip volatile markets
       
       const payout = (CONFIG.betSize / (noOutcome.price / 100)) - CONFIG.betSize;
       
@@ -89,9 +169,12 @@ function findNoValueBets(markets) {
         type: 'NO',
         question: market.question,
         probability: noOutcome.price,
+        volume: market.volume,
+        liquidity: market.liquidity,
+        daysToSettle: Math.ceil((new Date(market.endDate) - new Date()) / (1000 * 60 * 60 * 24)),
         potentialWin: payout,
         expectedValue: (noOutcome.price / 100) * payout - ((100 - noOutcome.price) / 100) * CONFIG.betSize,
-        endDate: market.endDate,
+        confidence,
         url: `https://polymarket.com/market/${market.slug || market.id}`
       });
     }
@@ -100,31 +183,34 @@ function findNoValueBets(markets) {
   return opportunities;
 }
 
-// ============== STRATEGY 2: YES POSITIONS (High Confidence) ==============
-// UPDATED: Target 85-98% probability (was 75-98%)
+// ============== STRATEGY 2: YES POSITIONS ==============
 function findYesValueBets(markets) {
   const opportunities = [];
   
   for (const market of markets) {
     if (!market.outcomePrices || !market.outcomeNames) continue;
-    if (new Date(market.endDate) < new Date()) continue;
     
     const outcomes = market.outcomeNames.map((name, i) => ({
       name,
       price: parseFloat(market.outcomePrices[i]) * 100
     }));
     
-    // Find YES outcome
     const yesOutcome = outcomes.find(o => 
-      o.name.toLowerCase() === 'yes' || 
-      o.name.toLowerCase() === 'positive'
+      o.name.toLowerCase() === 'yes' || o.name.toLowerCase() === 'positive'
     );
     
     if (!yesOutcome) continue;
     
-    // YES position with 85-98% probability = very high confidence
     if (yesOutcome.price >= CONFIG.minProbabilityYES && 
         yesOutcome.price <= CONFIG.maxProbabilityYES) {
+      
+      // Run safety checks
+      const safety = passesSafetyChecks(market, yesOutcome);
+      if (!safety.pass) continue;
+      
+      // Check confidence
+      const confidence = getConfidenceScore(market.id, yesOutcome.price);
+      if (confidence < 50) continue;
       
       const payout = (CONFIG.betSize / (yesOutcome.price / 100)) - CONFIG.betSize;
       
@@ -133,9 +219,12 @@ function findYesValueBets(markets) {
         type: 'YES',
         question: market.question,
         probability: yesOutcome.price,
+        volume: market.volume,
+        liquidity: market.liquidity,
+        daysToSettle: Math.ceil((new Date(market.endDate) - new Date()) / (1000 * 60 * 60 * 24)),
         potentialWin: payout,
         expectedValue: (yesOutcome.price / 100) * payout - ((100 - yesOutcome.price) / 100) * CONFIG.betSize,
-        endDate: market.endDate,
+        confidence,
         url: `https://polymarket.com/market/${market.slug || market.id}`
       });
     }
@@ -144,10 +233,10 @@ function findYesValueBets(markets) {
   return opportunities;
 }
 
-// ============== MAIN STRATEGY ==============
+// ============== MAIN ==============
 async function runStrategy() {
   console.log(`\n${'='.repeat(70)}`);
-  console.log(`🎲 POLYMARKET BOT v2.0 - ${new Date().toLocaleString()}`);
+  console.log(`🎲 POLYMARKET BOT v3.0 - ${new Date().toLocaleString()}`);
   console.log('='.repeat(70));
   
   if (dailyBetCount >= CONFIG.maxBetsPerDay) {
@@ -155,88 +244,73 @@ async function runStrategy() {
     return;
   }
   
-  console.log(`\n🔍 Scanning markets...`);
+  console.log(`\n🔍 Scanning markets with safety filters...`);
   
   const markets = await getMarkets();
   console.log(`📊 Found ${markets.length} active markets`);
   
-  // Strategy 1: NO positions (probability harvesting)
   const noBets = findNoValueBets(markets);
-  console.log(`\n🎯 Strategy 1 - NO Positions (${noBets.length} found):`);
-  noBets.slice(0, 5).forEach(b => {
-    console.log(`   NO: ${b.question.substring(0, 50)}...`);
-    console.log(`      Probability: ${b.probability.toFixed(1)}% | Win: $${b.potentialWin.toFixed(2)}`);
-  });
-  
-  // Strategy 2: YES positions (high confidence) - UPDATED 85%+
   const yesBets = findYesValueBets(markets);
-  console.log(`\n🎯 Strategy 2 - YES High Confidence (${yesBets.length} found):`);
-  yesBets.slice(0, 5).forEach(b => {
-    console.log(`   YES: ${b.question.substring(0, 50)}...`);
-    console.log(`      Probability: ${b.probability.toFixed(1)}% | Win: $${b.potentialWin.toFixed(2)}`);
-  });
   
-  // Prioritize: NO (safer) > YES (bigger wins)
+  console.log(`\n🎯 Opportunities:`);
+  console.log(`   NO (1-10%): ${noBets.length} | YES (85-98%): ${yesBets.length}`);
+  
+  if (noBets.length > 0) {
+    console.log(`\n🔥 TOP NO OPPORTUNITIES:`);
+    noBets.sort((a, b) => b.expectedValue - a.expectedValue).slice(0, 3).forEach(b => {
+      console.log(`   ${b.type}: ${b.question.substring(0, 40)}`);
+      console.log(`      ${b.probability.toFixed(1)}% | $${b.volume} vol | ${b.daysToSettle}d | Conf: ${b.confidence}%`);
+    });
+  }
+  
+  if (yesBets.length > 0) {
+    console.log(`\n🔥 TOP YES OPPORTUNITIES:`);
+    yesBets.sort((a, b) => b.expectedValue - a.expectedValue).slice(0, 3).forEach(b => {
+      console.log(`   ${b.type}: ${b.question.substring(0, 40)}`);
+      console.log(`      ${b.probability.toFixed(1)}% | $${b.volume} vol | ${b.daysToSettle}d | Conf: ${b.confidence}%`);
+    });
+  }
+  
   const allOpportunities = [
     ...noBets.map(b => ({...b, priority: 1})),
     ...yesBets.map(b => ({...b, priority: 2}))
   ];
   
-  // Sort by expected value (highest first)
   allOpportunities.sort((a, b) => b.expectedValue - a.expectedValue);
   
   if (allOpportunities.length > 0) {
     const best = allOpportunities[0];
-    console.log(`\n🔥 BEST OPPORTUNITY:`);
-    console.log(`   ${best.type}: ${best.question.substring(0, 50)}...`);
-    console.log(`   Probability: ${best.probability.toFixed(1)}% (higher = safer)`);
+    console.log(`\n🏆 BEST PICK:`);
+    console.log(`   ${best.type}: ${best.question}`);
+    console.log(`   Probability: ${best.probability.toFixed(1)}% | Confidence: ${best.confidence}%`);
+    console.log(`   Volume: $${best.volume} | Settles: ${best.daysToSettle} days`);
     console.log(`   Expected Value: $${best.expectedValue.toFixed(2)}`);
-    console.log(`   Link: ${best.url}`);
+    console.log(`   🔗 ${best.url}`);
     
-    // Record the bet
-    bets.push({
-      ...best,
-      amount: CONFIG.betSize,
-      placedAt: new Date().toISOString(),
-      status: 'PENDING'
-    });
-    
+    bets.push({ ...best, amount: CONFIG.betSize, placedAt: new Date().toISOString() });
     dailyBetCount++;
-    
-    console.log(`\n💰 To place bet: Visit link above and bet $${CONFIG.betSize} on ${best.type}`);
   } else {
-    console.log(`\n⏳ No opportunities found. Waiting for next scan...`);
+    console.log(`\n⏳ No opportunities meet all criteria`);
   }
   
-  printStats();
-}
-
-function printStats() {
-  console.log(`\n📈 STATS:`);
-  console.log(`   Today's bets: ${dailyBetCount}/${CONFIG.maxBetsPerDay}`);
-  console.log(`   Total found: ${bets.length}`);
-  
-  const byType = { NO: 0, YES: 0 };
-  bets.forEach(b => byType[b.type] = (byType[b.type] || 0) + 1);
-  
-  console.log(`   By type: NO: ${byType.NO} | YES: ${byType.YES}`);
+  console.log(`\n📈 Today: ${dailyBetCount}/${CONFIG.maxBetsPerDay} bets`);
 }
 
 async function main() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║         🎲 POLYMARKET BOT v2.0                                ║
-║         Two strategies: NO (1-10%) | YES (85-98%)             ║
+║         🎲 POLYMARKET BOT v3.0                                ║
+║         With Safety Filters & Confidence Scoring              ║
 ╚═══════════════════════════════════════════════════════════════╝
   `);
   
-  console.log(`⚙️ Configuration:`);
-  console.log(`   NO Probability: ${CONFIG.minProbabilityNO}-${CONFIG.maxProbabilityNO}%`);
-  console.log(`   YES Probability: ${CONFIG.minProbabilityYES}-${CONFIG.maxProbabilityYES}%`);
-  console.log(`   Bet Size: $${CONFIG.betSize}`);
-  console.log(`   Max Bets/Day: ${CONFIG.maxBetsPerDay}`);
+  console.log(`⚙️ Filters:`);
+  console.log(`   Min Volume: $${CONFIG.minVolume}`);
+  console.log(`   Min Liquidity: $${CONFIG.minLiquidity}`);
+  console.log(`   Max Days to Settle: ${CONFIG.maxDaysToSettle}`);
+  console.log(`   NO: ${CONFIG.minProbabilityNO}-${CONFIG.maxProbabilityNO}%`);
+  console.log(`   YES: ${CONFIG.minProbabilityYES}-${CONFIG.maxProbabilityYES}%`);
   
-  // Run immediately then every 5 minutes
   runStrategy();
   setInterval(runStrategy, 5 * 60 * 1000);
 }

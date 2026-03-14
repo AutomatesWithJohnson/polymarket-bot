@@ -4,28 +4,23 @@ const axios = require('axios');
 const CONFIG = {
   graphqlEndpoint: 'https://clob.polymarket.com/graphql',
   
-  // Strategy: Three main approaches
-  // 1. NO positions on near-zero probability (probability harvesting)
-  minProbabilityNO: 1,    // Very low % = high chance to win
-  maxProbabilityNO: 10,   // 1-10% probability
+  // Strategy 1: NO positions (probability harvesting)
+  // Target: 1-10% probability = 90-99% chance of winning
+  minProbabilityNO: 1,
+  maxProbabilityNO: 10,
   
-  // 2. YES positions on high probability (value bets)
-  minProbabilityYES: 75,  // 75%+ probability
+  // Strategy 2: YES positions (value bets) - UPDATED to 85-98%
+  minProbabilityYES: 85,
   maxProbabilityYES: 98,
   
-  // 3. Logical arbitrage - watch for correlated markets
-  betSize: 1, // Start small!
+  // Bet settings
+  betSize: 1,
   maxBetsPerDay: 20,
-  
-  // Exit strategies
-  takeProfitPercent: 50, // Take 50% profit if position is up
-  stopLossPercent: 25,   // Stop at 25% loss
 };
 
 // ============== STATE ==============
 let bets = [];
 let dailyBetCount = 0;
-let totalProfit = 0;
 
 // ============== POLYMARKET API ==============
 async function getMarkets() {
@@ -105,7 +100,8 @@ function findNoValueBets(markets) {
   return opportunities;
 }
 
-// ============== STRATEGY 2: YES POSITIONS (Value Bets) ==============
+// ============== STRATEGY 2: YES POSITIONS (High Confidence) ==============
+// UPDATED: Target 85-98% probability (was 75-98%)
 function findYesValueBets(markets) {
   const opportunities = [];
   
@@ -126,7 +122,7 @@ function findYesValueBets(markets) {
     
     if (!yesOutcome) continue;
     
-    // YES position with 75-98% probability = high confidence
+    // YES position with 85-98% probability = very high confidence
     if (yesOutcome.price >= CONFIG.minProbabilityYES && 
         yesOutcome.price <= CONFIG.maxProbabilityYES) {
       
@@ -148,61 +144,10 @@ function findYesValueBets(markets) {
   return opportunities;
 }
 
-// ============== STRATEGY 3: LOGICAL ARBITRAGE ==============
-// Find markets where one outcome implies another
-function findArbitrageOpportunities(markets) {
-  const opportunities = [];
-  
-  // Look for correlated keywords
-  const correlations = [
-    { keywords: ['trump', 'republican'], implies: 'Republican wins' },
-    { keywords: ['biden', 'democrat'], implies: 'Democrat wins' },
-    { keywords: ['bitcoin', 'btc', '100k'], implies: 'Bitcoin higher' },
-    { keywords: ['rate', 'fed', 'cut'], implies: 'Rate cut' },
-  ];
-  
-  for (const market of markets) {
-    if (!market.outcomePrices || !market.outcomeNames) continue;
-    if (new Date(market.endDate) < new Date()) continue;
-    
-    const question = market.question.toLowerCase();
-    const desc = (market.description || '').toLowerCase();
-    const combined = question + ' ' + desc;
-    
-    for (const corr of correlations) {
-      if (corr.keywords.some(k => combined.includes(k))) {
-        const outcomes = market.outcomeNames.map((name, i) => ({
-          name,
-          price: parseFloat(market.outcomePrices[i]) * 100
-        }));
-        
-        const yesOutcome = outcomes.find(o => 
-          o.name.toLowerCase().includes('yes')
-        );
-        
-        if (yesOutcome && yesOutcome.price > 60 && yesOutcome.price < 90) {
-          opportunities.push({
-            id: market.id,
-            type: 'ARBITRAGE',
-            question: market.question,
-            probability: yesOutcome.price,
-            note: `Correlated with: ${corr.implies}`,
-            potentialWin: (CONFIG.betSize * 2 / (yesOutcome.price / 100)) - CONFIG.betSize * 2,
-            endDate: market.endDate,
-            url: `https://polymarket.com/market/${market.slug || market.id}`
-          });
-        }
-      }
-    }
-  }
-  
-  return opportunities;
-}
-
 // ============== MAIN STRATEGY ==============
 async function runStrategy() {
   console.log(`\n${'='.repeat(70)}`);
-  console.log(`🎲 POLYMARKET ALPHA BOT - ${new Date().toLocaleString()}`);
+  console.log(`🎲 POLYMARKET BOT v2.0 - ${new Date().toLocaleString()}`);
   console.log('='.repeat(70));
   
   if (dailyBetCount >= CONFIG.maxBetsPerDay) {
@@ -218,42 +163,33 @@ async function runStrategy() {
   // Strategy 1: NO positions (probability harvesting)
   const noBets = findNoValueBets(markets);
   console.log(`\n🎯 Strategy 1 - NO Positions (${noBets.length} found):`);
-  noBets.slice(0, 3).forEach(b => {
-    console.log(`   ${b.type}: ${b.question.substring(0, 40)}...`);
+  noBets.slice(0, 5).forEach(b => {
+    console.log(`   NO: ${b.question.substring(0, 50)}...`);
     console.log(`      Probability: ${b.probability.toFixed(1)}% | Win: $${b.potentialWin.toFixed(2)}`);
   });
   
-  // Strategy 2: YES positions (value bets)
+  // Strategy 2: YES positions (high confidence) - UPDATED 85%+
   const yesBets = findYesValueBets(markets);
-  console.log(`\n🎯 Strategy 2 - YES Value Bets (${yesBets.length} found):`);
-  yesBets.slice(0, 3).forEach(b => {
-    console.log(`   ${b.type}: ${b.question.substring(0, 40)}...`);
+  console.log(`\n🎯 Strategy 2 - YES High Confidence (${yesBets.length} found):`);
+  yesBets.slice(0, 5).forEach(b => {
+    console.log(`   YES: ${b.question.substring(0, 50)}...`);
     console.log(`      Probability: ${b.probability.toFixed(1)}% | Win: $${b.potentialWin.toFixed(2)}`);
   });
   
-  // Strategy 3: Arbitrage
-  const arbBets = findArbitrageOpportunities(markets);
-  console.log(`\n🎯 Strategy 3 - Arbitrage (${arbBets.length} found):`);
-  arbBets.slice(0, 3).forEach(b => {
-    console.log(`   ${b.type}: ${b.question.substring(0, 40)}...`);
-    console.log(`      ${b.note}`);
-  });
-  
-  // Prioritize: NO > ARBITRAGE > YES
+  // Prioritize: NO (safer) > YES (bigger wins)
   const allOpportunities = [
     ...noBets.map(b => ({...b, priority: 1})),
-    ...arbBets.map(b => ({...b, priority: 2})),
-    ...yesBets.map(b => ({...b, priority: 3}))
+    ...yesBets.map(b => ({...b, priority: 2}))
   ];
   
-  // Sort by expected value
+  // Sort by expected value (highest first)
   allOpportunities.sort((a, b) => b.expectedValue - a.expectedValue);
   
   if (allOpportunities.length > 0) {
     const best = allOpportunities[0];
     console.log(`\n🔥 BEST OPPORTUNITY:`);
     console.log(`   ${best.type}: ${best.question.substring(0, 50)}...`);
-    console.log(`   Probability: ${best.probability.toFixed(1)}%`);
+    console.log(`   Probability: ${best.probability.toFixed(1)}% (higher = safer)`);
     console.log(`   Expected Value: $${best.expectedValue.toFixed(2)}`);
     console.log(`   Link: ${best.url}`);
     
@@ -267,7 +203,7 @@ async function runStrategy() {
     
     dailyBetCount++;
     
-    console.log(`\n💰 To place bet: Visit the link above and bet $${CONFIG.betSize} on ${best.type}`);
+    console.log(`\n💰 To place bet: Visit link above and bet $${CONFIG.betSize} on ${best.type}`);
   } else {
     console.log(`\n⏳ No opportunities found. Waiting for next scan...`);
   }
@@ -278,30 +214,19 @@ async function runStrategy() {
 function printStats() {
   console.log(`\n📈 STATS:`);
   console.log(`   Today's bets: ${dailyBetCount}/${CONFIG.maxBetsPerDay}`);
-  console.log(`   Total opportunities found: ${bets.length}`);
+  console.log(`   Total found: ${bets.length}`);
   
-  const byType = { NO: 0, YES: 0, ARBITRAGE: 0 };
+  const byType = { NO: 0, YES: 0 };
   bets.forEach(b => byType[b.type] = (byType[b.type] || 0) + 1);
   
-  console.log(`   By type: NO: ${byType.NO} | YES: ${byType.YES} | ARB: ${byType.ARBITRAGE}`);
-}
-
-function saveLogs() {
-  const fs = require('fs');
-  fs.writeFileSync('/data/workspace/polymarket-bot/logs.json', JSON.stringify({
-    timestamp: new Date().toISOString(),
-    dailyBetCount,
-    totalProfit,
-    bets: bets.slice(-100)
-  }, null, 2));
+  console.log(`   By type: NO: ${byType.NO} | YES: ${byType.YES}`);
 }
 
 async function main() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║         🎲 POLYMARKET ALPHA BOT v2.0                          ║
-║         Three strategies: NO | ARBITRAGE | YES                ║
-║         Based on the $3.7M framework                          ║
+║         🎲 POLYMARKET BOT v2.0                                ║
+║         Two strategies: NO (1-10%) | YES (85-98%)             ║
 ╚═══════════════════════════════════════════════════════════════╝
   `);
   
